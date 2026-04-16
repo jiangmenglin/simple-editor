@@ -1,0 +1,8 @@
+[package]
+name = "simple-editor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = "0.28"
+clipboard = "0.5"
