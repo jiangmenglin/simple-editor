@@ -93,7 +93,7 @@ impl Editor {
             }
         };
 
-        let content: String = self.rows.iter().map(|r| r.chars.as_str()).collect::<Vec<_>>().join("\n");
+        let content: String = self.rows.iter().map(|r| r.as_str()).collect::<Vec<_>>().join("\n");
         std::fs::write(&filename, content)?;
         self.dirty = false;
         self.set_status(&format!("Saved to {}", filename));
@@ -138,33 +138,14 @@ impl Editor {
     fn copy_selection(&mut self) {
         if let Some(((sr, sc), (er, ec))) = self.get_selection_range() {
             let text = if sr == er {
-                // Single row selection
-                let row = &self.rows[sr];
-                let end = ec.min(row.chars.len());
-                if sc < end {
-                    row.chars[sc..end].to_string()
-                } else {
-                    String::new()
-                }
+                self.rows[sr].substring(sc, ec)
             } else {
-                // Multi-row selection
                 let mut parts = Vec::new();
-                // First row
-                let first = &self.rows[sr];
-                if sc < first.chars.len() {
-                    parts.push(first.chars[sc..].to_string());
-                } else {
-                    parts.push(String::new());
-                }
-                // Middle rows
+                parts.push(self.rows[sr].substring_from(sc));
                 for i in (sr + 1)..er {
-                    parts.push(self.rows[i].chars.clone());
+                    parts.push(self.rows[i].as_str());
                 }
-                // Last row
-                let last = &self.rows[er];
-                let end = ec.min(last.chars.len());
-                parts.push(last.chars[..end].to_string());
-
+                parts.push(self.rows[er].substring_to(ec));
                 parts.join("\n")
             };
 
@@ -181,19 +162,11 @@ impl Editor {
     fn delete_selection(&mut self) {
         if let Some(((sr, sc), (er, ec))) = self.get_selection_range() {
             if sr == er {
-                let row = &mut self.rows[sr];
-                let end = ec.min(row.chars.len());
-                if sc < end {
-                    row.chars.replace_range(sc..end, "");
-                }
+                self.rows[sr].delete_range(sc, ec);
             } else {
                 // Keep prefix of first row + suffix of last row
-                let first_prefix = self.rows[sr].chars[..sc].to_string();
-                let last_suffix = {
-                    let last = &self.rows[er];
-                    let end = ec.min(last.chars.len());
-                    last.chars[end..].to_string()
-                };
+                let first_prefix = self.rows[sr].substring_to(sc);
+                let last_suffix = self.rows[er].substring_from(ec);
                 // Remove rows sr..=er, then set row sr to combined
                 self.rows.drain(sr..=er);
                 let combined = format!("{}{}", first_prefix, last_suffix);
@@ -340,11 +313,12 @@ impl Editor {
         let (term_cols, _) = Terminal::size().unwrap_or((80, 24));
         let term_cols = term_cols as usize;
 
-        if self.cursor_col < self.offset_col {
-            self.offset_col = self.cursor_col;
+        let cursor_display_col = self.rows[self.cursor_row].display_width_to(self.cursor_col);
+        if cursor_display_col < self.offset_col {
+            self.offset_col = cursor_display_col;
         }
-        if self.cursor_col >= self.offset_col + term_cols {
-            self.offset_col = self.cursor_col - term_cols + 1;
+        if cursor_display_col >= self.offset_col + term_cols {
+            self.offset_col = cursor_display_col - term_cols + 1;
         }
     }
 
@@ -504,7 +478,8 @@ impl Editor {
                 }
             } else {
                 let row = &self.rows[file_row];
-                let render_str = row.render(self.offset_col, term_cols);
+                let start_char = row.char_at_display_col(self.offset_col);
+                let render_str = row.render(start_char, term_cols);
 
                 // Character-by-character rendering for highlights
                 let chars: Vec<char> = render_str.chars().collect();
@@ -512,11 +487,11 @@ impl Editor {
                 let mut in_selection = false;
 
                 for (ci, ch) in chars.iter().enumerate() {
-                    let actual_col = self.offset_col + ci;
+                    let actual_col = start_char + ci;
 
                     // Check if this char is part of a search match
                     let is_match = if !self.find.input.is_empty() {
-                        let qlen = self.find.input.len();
+                        let qlen = self.find.input.chars().count();
                         match_positions.iter().any(|&(r, c)| {
                             r == file_row && actual_col >= c && actual_col < c + qlen
                         })
@@ -577,7 +552,8 @@ impl Editor {
         let right = format!(" Ln {}, Col {} ", self.cursor_row + 1, self.cursor_col + 1);
 
         let left_padded = format!("{:<width$}", left, width = term_cols);
-        execute!(stdout, crossterm::style::Print(&left_padded[..term_cols]))?;
+        let truncated: String = left_padded.chars().take(term_cols).collect();
+        execute!(stdout, crossterm::style::Print(&truncated))?;
 
         // Draw right-aligned part
         if right.len() < term_cols {
@@ -604,11 +580,8 @@ impl Editor {
         execute!(stdout, cursor::MoveTo(0, y))?;
         execute!(stdout, terminal::Clear(ClearType::CurrentLine))?;
 
-        if self.status_msg.len() > term_cols {
-            execute!(stdout, crossterm::style::Print(&self.status_msg[..term_cols]))?;
-        } else {
-            execute!(stdout, crossterm::style::Print(&self.status_msg))?;
-        }
+        let truncated: String = self.status_msg.chars().take(term_cols).collect();
+        execute!(stdout, crossterm::style::Print(&truncated))?;
         Ok(())
     }
 
@@ -623,7 +596,8 @@ impl Editor {
 
         // Position cursor
         let screen_row = (self.cursor_row - self.offset_row) as u16;
-        let screen_col = (self.cursor_col - self.offset_col) as u16;
+        let cursor_display_col = self.rows[self.cursor_row].display_width_to(self.cursor_col);
+        let screen_col = (cursor_display_col - self.offset_col) as u16;
         Terminal::move_cursor(screen_row, screen_col)?;
         Terminal::flush()?;
         Ok(())
