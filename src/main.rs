@@ -2,6 +2,8 @@ mod editor;
 mod row;
 mod terminal;
 mod find;
+mod syntax;
+mod undo;
 
 use std::env;
 use std::io;

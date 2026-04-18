@@ -14,6 +14,8 @@ use clipboard::ClipboardProvider;
 use crate::find::FindState;
 use crate::row::Row;
 use crate::terminal::Terminal;
+use crate::syntax::{self, HighlightType};
+use crate::undo::{UndoHistory, EditAction};
 
 /// Helper: get text from system clipboard
 fn get_clipboard_text() -> Option<String> {
@@ -41,6 +43,9 @@ pub struct Editor {
     sel_start: Option<(usize, usize)>,
     /// Whether the status message should persist (for search results etc.)
     status_persist: bool,
+    show_line_numbers: bool,
+    language: Option<&'static syntax::LanguageConfig>,
+    undo: UndoHistory,
 }
 
 impl Editor {
@@ -58,10 +63,14 @@ impl Editor {
             status_msg: String::new(),
             sel_start: None,
             status_persist: false,
+            show_line_numbers: false,
+            language: None,
+            undo: UndoHistory::new(),
         };
         if let Some(ref fname) = filename {
             editor.open_file(fname)?;
             editor.filename = Some(fname.clone());
+            editor.language = syntax::detect_language(fname);
         }
         Ok(editor)
     }
@@ -75,6 +84,7 @@ impl Editor {
             self.rows.push(Row::new());
         }
         self.dirty = false;
+        self.undo.clear();
         Ok(())
     }
 
@@ -109,10 +119,24 @@ impl Editor {
         self.filename = None;
         self.dirty = false;
         self.sel_start = None;
+        self.undo.clear();
         self.set_status("New file created.");
     }
 
     // ---- Status ----
+
+    fn gutter_width(&self) -> usize {
+        if !self.show_line_numbers {
+            return 0;
+        }
+        let num_lines = self.rows.len();
+        let digits = if num_lines < 10 { 1 }
+            else if num_lines < 100 { 2 }
+            else if num_lines < 1000 { 3 }
+            else if num_lines < 10000 { 4 }
+            else { 5 };
+        digits + 2
+    }
 
     fn set_status(&mut self, msg: &str) {
         self.status_msg = msg.to_string();
@@ -179,21 +203,48 @@ impl Editor {
         }
     }
 
+    fn get_selected_text(&self) -> Option<String> {
+        let ((sr, sc), (er, ec)) = self.get_selection_range()?;
+        let text = if sr == er {
+            self.rows[sr].substring(sc, ec)
+        } else {
+            let mut parts = Vec::new();
+            parts.push(self.rows[sr].substring_from(sc));
+            for i in (sr + 1)..er {
+                parts.push(self.rows[i].as_str());
+            }
+            parts.push(self.rows[er].substring_to(ec));
+            parts.join("\n")
+        };
+        Some(text)
+    }
+
     fn paste_from_clipboard(&mut self) {
         if let Some(text) = get_clipboard_text() {
-            self.insert_string(&text);
+            // Track selection deletion for undo
+            if self.sel_start.is_some() && self.get_selection_range().is_some() {
+                if let Some(deleted) = self.get_selected_text() {
+                    let ((sr, sc), (er, ec)) = self.get_selection_range().unwrap();
+                    self.delete_selection();
+                    self.undo.push(EditAction::DeleteSelection {
+                        start_row: sr, start_col: sc,
+                        end_row: er, end_col: ec,
+                        deleted_text: deleted,
+                    });
+                }
+            }
+            let cr = self.cursor_row;
+            let cc = self.cursor_col;
+            self.insert_string_no_sel(&text);
+            self.undo.push(EditAction::InsertString { row: cr, col: cc, text: text.clone() });
+            self.dirty = true;
             self.set_status(&format!("Pasted {} chars", text.len()));
         } else {
             self.set_status("Paste failed (clipboard unavailable)");
         }
     }
 
-    fn insert_string(&mut self, text: &str) {
-        // Delete any active selection first
-        if self.sel_start.is_some() && self.get_selection_range().is_some() {
-            self.delete_selection();
-        }
-
+    fn insert_string_no_sel(&mut self, text: &str) {
         let lines: Vec<&str> = text.split('\n').collect();
         for (i, line) in lines.iter().enumerate() {
             if i > 0 {
@@ -203,7 +254,6 @@ impl Editor {
                 self.insert_char_internal(c);
             }
         }
-        self.dirty = true;
     }
 
     // ---- Core editing ----
@@ -221,28 +271,254 @@ impl Editor {
         self.cursor_col = 0;
     }
 
-    fn delete_char_internal(&mut self) {
+    // ---- Tracked editing (for undo) ----
+
+    fn delete_char_back_tracked(&mut self) -> Option<EditAction> {
         if self.cursor_col > 0 {
+            let ch = self.rows[self.cursor_row].chars()[self.cursor_col - 1];
+            let row = self.cursor_row;
+            let col = self.cursor_col;
             self.rows[self.cursor_row].delete(self.cursor_col - 1);
             self.cursor_col -= 1;
+            Some(EditAction::DeleteCharBack { row, col, ch })
         } else if self.cursor_row > 0 {
-            // Merge with previous row
             let prev_len = self.rows[self.cursor_row - 1].len();
+            let moved_text = self.rows[self.cursor_row].as_str();
+            let row = self.cursor_row;
             let current = self.rows.remove(self.cursor_row);
             self.cursor_row -= 1;
             self.rows[self.cursor_row].append(&current);
             self.cursor_col = prev_len;
+            Some(EditAction::MergeRowsBack { row, prev_len, moved_text })
+        } else {
+            None
         }
     }
 
-    fn delete_char_forward(&mut self) {
-        let row = &mut self.rows[self.cursor_row];
-        if self.cursor_col < row.len() {
-            row.delete(self.cursor_col);
+    fn delete_char_forward_tracked(&mut self) -> Option<EditAction> {
+        if self.cursor_col < self.rows[self.cursor_row].len() {
+            let ch = self.rows[self.cursor_row].chars()[self.cursor_col];
+            let row = self.cursor_row;
+            let col = self.cursor_col;
+            self.rows[self.cursor_row].delete(self.cursor_col);
+            Some(EditAction::DeleteCharForward { row, col, ch })
         } else if self.cursor_row + 1 < self.rows.len() {
-            // Merge next row into current
-            let next = self.rows.remove(self.cursor_row + 1);
-            self.rows[self.cursor_row].append(&next);
+            let original_len = self.rows[self.cursor_row].len();
+            let next_text = self.rows[self.cursor_row + 1].as_str();
+            let row = self.cursor_row;
+            self.rows.remove(self.cursor_row + 1);
+            // Reconstruct: need to get the combined text and re-split
+            // Actually we just append, so rows[row] now has original content + next_text
+            let next_row = Row::from(next_text.as_str());
+            self.rows[self.cursor_row].append(&next_row);
+            Some(EditAction::MergeRowsForward { row, original_len, next_text: next_text.to_string() })
+        } else {
+            None
+        }
+    }
+
+    // ---- Undo/Redo ----
+
+    fn do_undo(&mut self) {
+        let action = match self.undo.undo_action() {
+            Some(a) => a.clone(),
+            None => return,
+        };
+        match action {
+            EditAction::InsertChar { row, col, .. } => {
+                self.cursor_row = row;
+                self.cursor_col = col + 1;
+                self.rows[row].delete(col);
+                self.cursor_col = col;
+            }
+            EditAction::DeleteCharBack { row, col, ch } => {
+                self.rows[row].insert(col - 1, ch);
+                self.cursor_row = row;
+                self.cursor_col = col;
+            }
+            EditAction::DeleteCharForward { row, col, ch } => {
+                self.rows[row].insert(col, ch);
+                self.cursor_row = row;
+                self.cursor_col = col;
+            }
+            EditAction::MergeRowsBack { row, prev_len, moved_text: _ } => {
+                // Undo: row was merged into row-1 at position prev_len.
+                // Split row-1 at prev_len to recreate the original row.
+                let new_row = self.rows[row - 1].split(prev_len);
+                self.rows.insert(row, new_row);
+                self.cursor_row = row;
+                self.cursor_col = 0;
+            }
+            EditAction::MergeRowsForward { row, original_len, next_text: _ } => {
+                // Undo: next row was merged into current row at original_len.
+                // Split current row at original_len to recreate next row.
+                let new_row = self.rows[row].split(original_len);
+                self.rows.insert(row + 1, new_row);
+                self.cursor_row = row;
+                self.cursor_col = original_len;
+            }
+            EditAction::InsertNewline { row, col } => {
+                // Undo: merge row+1 back into row at col
+                let next = self.rows.remove(row + 1);
+                self.rows[row].append(&next);
+                self.cursor_row = row;
+                self.cursor_col = col;
+            }
+            EditAction::InsertTab { row, col } => {
+                self.rows[row].delete_range(col, col + 4);
+                self.cursor_row = row;
+                self.cursor_col = col;
+            }
+            EditAction::DeleteSelection { start_row, start_col, deleted_text, .. } => {
+                self.insert_string_at(start_row, start_col, &deleted_text);
+                self.cursor_row = start_row;
+                self.cursor_col = start_col;
+            }
+            EditAction::InsertString { row, col, text } => {
+                self.delete_string_at(row, col, &text);
+                self.cursor_row = row;
+                self.cursor_col = col;
+            }
+            EditAction::ReplaceAll { old_rows } => {
+                self.rows = old_rows.iter().map(|s| Row::from(s.as_str())).collect();
+                if self.rows.is_empty() {
+                    self.rows.push(Row::new());
+                }
+                self.cursor_row = self.cursor_row.min(self.rows.len() - 1);
+                self.cursor_col = self.cursor_col.min(self.rows[self.cursor_row].len());
+            }
+        }
+        self.dirty = true;
+        self.sel_start = None;
+    }
+
+    fn do_redo(&mut self) {
+        let action = match self.undo.redo_action() {
+            Some(a) => a.clone(),
+            None => return,
+        };
+        match action {
+            EditAction::InsertChar { row, col, ch } => {
+                self.rows[row].insert(col, ch);
+                self.cursor_row = row;
+                self.cursor_col = col + 1;
+            }
+            EditAction::DeleteCharBack { row, col, ch: _ } => {
+                self.rows[row].delete(col - 1);
+                self.cursor_row = row;
+                self.cursor_col = col - 1;
+            }
+            EditAction::DeleteCharForward { row, col, ch: _ } => {
+                self.rows[row].delete(col);
+                self.cursor_row = row;
+                self.cursor_col = col;
+            }
+            EditAction::MergeRowsBack { row, prev_len, moved_text: _ } => {
+                let current = self.rows.remove(row);
+                self.cursor_row = row - 1;
+                self.rows[self.cursor_row].append(&current);
+                self.cursor_col = prev_len;
+            }
+            EditAction::MergeRowsForward { row, original_len: _, next_text: _ } => {
+                let next = self.rows.remove(row + 1);
+                self.rows[row].append(&next);
+                self.cursor_row = row;
+                self.cursor_col = self.rows[row].len() - next.len();
+            }
+            EditAction::InsertNewline { row, col } => {
+                let new_row = self.rows[row].split(col);
+                self.rows.insert(row + 1, new_row);
+                self.cursor_row = row + 1;
+                self.cursor_col = 0;
+            }
+            EditAction::InsertTab { row, col } => {
+                for _ in 0..4 {
+                    self.rows[row].insert(col, ' ');
+                }
+                self.cursor_row = row;
+                self.cursor_col = col + 4;
+            }
+            EditAction::DeleteSelection { start_row, start_col, end_row, end_col, .. } => {
+                // Re-perform the deletion
+                if start_row == end_row {
+                    self.rows[start_row].delete_range(start_col, end_col);
+                } else {
+                    let first_prefix = self.rows[start_row].substring_to(start_col);
+                    let last_suffix = self.rows[end_row].substring_from(end_col);
+                    self.rows.drain(start_row..=end_row);
+                    let combined = format!("{}{}", first_prefix, last_suffix);
+                    self.rows.insert(start_row, Row::from(&combined));
+                }
+                self.cursor_row = start_row;
+                self.cursor_col = start_col;
+            }
+            EditAction::InsertString { row, col, text } => {
+                self.insert_string_at(row, col, &text);
+                // Calculate final position
+                let lines: Vec<&str> = text.split('\n').collect();
+                if lines.len() == 1 {
+                    self.cursor_row = row;
+                    self.cursor_col = col + text.chars().count();
+                } else {
+                    self.cursor_row = row + lines.len() - 1;
+                    self.cursor_col = lines.last().map(|l| l.chars().count()).unwrap_or(0);
+                }
+            }
+            EditAction::ReplaceAll { old_rows: _ } => {
+                // Can't redo ReplaceAll without storing the replacement info.
+                // For now, this is a no-op since we don't store the replacement details.
+            }
+        }
+        self.dirty = true;
+        self.sel_start = None;
+    }
+
+    /// Insert a string at a specific position without using cursor
+    fn insert_string_at(&mut self, row: usize, col: usize, text: &str) {
+        let lines: Vec<&str> = text.split('\n').collect();
+        if lines.len() == 1 {
+            for (j, c) in text.chars().enumerate() {
+                self.rows[row].insert(col + j, c);
+            }
+        } else {
+            // Split current row at col
+            let suffix = self.rows[row].substring_from(col);
+            let row_len = self.rows[row].len();
+            self.rows[row].delete_range(col, row_len);
+
+            // Add first line content to current row
+            for c in lines[0].chars() {
+                self.rows[row].insert(col, c);
+            }
+
+            // Insert middle rows
+            let mut insert_pos = row + 1;
+            for line in &lines[1..lines.len() - 1] {
+                self.rows.insert(insert_pos, Row::from(line));
+                insert_pos += 1;
+            }
+
+            // Last line + suffix
+            let mut last_row = Row::from(lines[lines.len() - 1]);
+            let suffix_row = Row::from(&suffix);
+            last_row.append(&suffix_row);
+            self.rows.insert(insert_pos, last_row);
+        }
+    }
+
+    /// Delete a string that was inserted at (row, col)
+    fn delete_string_at(&mut self, row: usize, col: usize, text: &str) {
+        let lines: Vec<&str> = text.split('\n').collect();
+        if lines.len() == 1 {
+            self.rows[row].delete_range(col, col + text.chars().count());
+        } else {
+            let prefix = self.rows[row].substring_to(col);
+            let last_line_len = lines.last().map(|l| l.chars().count()).unwrap_or(0);
+            let end_row = row + lines.len() - 1;
+            let suffix = self.rows[end_row].substring_from(last_line_len);
+            self.rows.drain(row..=end_row);
+            let combined = format!("{}{}", prefix, suffix);
+            self.rows.insert(row, Row::from(&combined));
         }
     }
 
@@ -311,14 +587,14 @@ impl Editor {
         }
 
         let (term_cols, _) = Terminal::size().unwrap_or((80, 24));
-        let term_cols = term_cols as usize;
+        let text_area_width = term_cols as usize - self.gutter_width();
 
         let cursor_display_col = self.rows[self.cursor_row].display_width_to(self.cursor_col);
         if cursor_display_col < self.offset_col {
             self.offset_col = cursor_display_col;
         }
-        if cursor_display_col >= self.offset_col + term_cols {
-            self.offset_col = cursor_display_col - term_cols + 1;
+        if cursor_display_col >= self.offset_col + text_area_width {
+            self.offset_col = cursor_display_col - text_area_width + 1;
         }
     }
 
@@ -418,11 +694,16 @@ impl Editor {
 
         let replacement = self.prompt(&format!("Replace '{}' with: ", query))?;
 
+        // Snapshot rows for undo
+        let old_rows: Vec<String> = self.rows.iter().map(|r| r.as_str()).collect();
+
         // Do the replacement
         let mut count = 0;
         for row in &mut self.rows {
             count += row.replace_all(&query, &replacement);
         }
+
+        self.undo.push(EditAction::ReplaceAll { old_rows });
 
         // Fix cursor if it's now out of bounds
         if self.cursor_row >= self.rows.len() {
@@ -441,6 +722,8 @@ impl Editor {
         let (term_cols, term_rows) = Terminal::size().unwrap_or((80, 24));
         let term_cols = term_cols as usize;
         let term_rows = term_rows as usize;
+        let gutter_w = self.gutter_width();
+        let text_area_width = term_cols - gutter_w;
 
         // Collect match positions for highlighting
         let match_positions: HashSet<(usize, usize)> = {
@@ -454,21 +737,41 @@ impl Editor {
         // Get selection range for highlighting
         let sel_range = self.get_selection_range();
 
+        // Pre-compute block comment state up to the first visible row
+        let mut in_block_comment = false;
+        if let Some(lang) = self.language {
+            if lang.block_comment.is_some() {
+                for r in 0..self.offset_row.min(self.rows.len()) {
+                    let row_chars: Vec<char> = self.rows[r].as_str().chars().collect();
+                    let (_, state) = syntax::highlight_row(&row_chars, lang, in_block_comment);
+                    in_block_comment = state;
+                }
+            }
+        }
+
         for i in 0..term_rows.saturating_sub(1) {
             let file_row = self.offset_row + i;
             execute!(stdout, cursor::MoveTo(0, i as u16))?;
 
+            // Render gutter (line numbers or ~)
             if file_row >= self.rows.len() {
                 // Empty area
+                if self.show_line_numbers {
+                    execute!(stdout, SetForegroundColor(Color::DarkBlue))?;
+                    execute!(stdout, crossterm::style::Print(format!("{:>width$} ", "~", width = gutter_w - 1)))?;
+                    execute!(stdout, SetForegroundColor(Color::Reset))?;
+                }
                 if self.rows.len() == 1 && self.rows[0].is_empty() && i == 0 {
-                    execute!(stdout, crossterm::style::Print("~ "))?;
+                    if !self.show_line_numbers {
+                        execute!(stdout, crossterm::style::Print("~ "))?;
+                    }
                     execute!(
                         stdout,
                         SetForegroundColor(Color::DarkCyan),
                         crossterm::style::Print("Simple Editor - Ctrl+Q:Quit Ctrl+S:Save Ctrl+N:New Ctrl+F:Find Ctrl+H:Replace"),
                         SetForegroundColor(Color::Reset)
                     )?;
-                } else {
+                } else if !self.show_line_numbers {
                     execute!(
                         stdout,
                         SetForegroundColor(Color::DarkBlue),
@@ -477,14 +780,36 @@ impl Editor {
                     )?;
                 }
             } else {
+                // Render line number
+                if self.show_line_numbers {
+                    let line_num = file_row + 1;
+                    execute!(
+                        stdout,
+                        SetForegroundColor(Color::DarkGrey),
+                        crossterm::style::Print(format!("{:>width$} ", line_num, width = gutter_w - 1)),
+                        SetForegroundColor(Color::Reset)
+                    )?;
+                }
                 let row = &self.rows[file_row];
                 let start_char = row.char_at_display_col(self.offset_col);
-                let render_str = row.render(start_char, term_cols);
+                let render_str = row.render(start_char, text_area_width);
+
+                // Compute syntax highlights for this row
+                let syntax_highlights: Vec<HighlightType> = if let Some(lang) = self.language {
+                    let row_chars: Vec<char> = row.as_str().chars().collect();
+                    let (h, new_block) = syntax::highlight_row(&row_chars, lang, in_block_comment);
+                    in_block_comment = new_block;
+                    h
+                } else {
+                    in_block_comment = false;
+                    Vec::new()
+                };
 
                 // Character-by-character rendering for highlights
                 let chars: Vec<char> = render_str.chars().collect();
                 let mut in_match = false;
                 let mut in_selection = false;
+                let mut current_syntax_color: Option<Color> = None;
 
                 for (ci, ch) in chars.iter().enumerate() {
                     let actual_col = start_char + ci;
@@ -507,6 +832,14 @@ impl Editor {
                         false
                     };
 
+                    // Syntax highlight color for this char
+                    let syn_color = if actual_col < syntax_highlights.len() {
+                        syntax_highlights[actual_col].foreground_color()
+                    } else {
+                        None
+                    };
+
+                    // Apply search match highlight (highest priority)
                     if is_match && !in_match {
                         execute!(stdout, SetBackgroundColor(Color::DarkYellow), SetForegroundColor(Color::Black))?;
                         in_match = true;
@@ -515,6 +848,7 @@ impl Editor {
                         in_match = false;
                     }
 
+                    // Apply selection highlight
                     if is_selected && !in_selection {
                         execute!(stdout, SetBackgroundColor(Color::DarkCyan), SetForegroundColor(Color::White))?;
                         in_selection = true;
@@ -523,10 +857,22 @@ impl Editor {
                         in_selection = false;
                     }
 
+                    // Apply syntax highlight (only when no search/selection override)
+                    if !is_match && !is_selected {
+                        if syn_color != current_syntax_color {
+                            if let Some(c) = syn_color {
+                                execute!(stdout, SetForegroundColor(c))?;
+                            } else {
+                                execute!(stdout, SetForegroundColor(Color::Reset))?;
+                            }
+                            current_syntax_color = syn_color;
+                        }
+                    }
+
                     execute!(stdout, crossterm::style::Print(ch))?;
                 }
 
-                if in_match || in_selection {
+                if in_match || in_selection || current_syntax_color.is_some() {
                     execute!(stdout, SetBackgroundColor(Color::Reset), SetForegroundColor(Color::Reset))?;
                 }
             }
@@ -588,6 +934,7 @@ impl Editor {
     fn refresh_screen(&mut self) -> io::Result<()> {
         self.scroll();
         let mut stdout = io::stdout();
+        let gutter_w = self.gutter_width();
 
         execute!(stdout, terminal::Clear(ClearType::All))?;
         self.draw_rows(&mut stdout)?;
@@ -597,7 +944,7 @@ impl Editor {
         // Position cursor
         let screen_row = (self.cursor_row - self.offset_row) as u16;
         let cursor_display_col = self.rows[self.cursor_row].display_width_to(self.cursor_col);
-        let screen_col = (cursor_display_col - self.offset_col) as u16;
+        let screen_col = (cursor_display_col - self.offset_col + gutter_w) as u16;
         Terminal::move_cursor(screen_row, screen_col)?;
         Terminal::flush()?;
         Ok(())
@@ -696,11 +1043,21 @@ impl Editor {
                         'v' => {
                             self.paste_from_clipboard();
                         }
+                        'z' => {
+                            self.do_undo();
+                        }
+                        'y' => {
+                            self.do_redo();
+                        }
                         'a' => {
                             // Select all
                             self.sel_start = Some((0, 0));
                             self.cursor_row = self.rows.len() - 1;
                             self.cursor_col = self.rows[self.cursor_row].len();
+                        }
+                        'l' => {
+                            self.show_line_numbers = !self.show_line_numbers;
+                            self.set_status(if self.show_line_numbers { "Line numbers ON" } else { "Line numbers OFF" });
                         }
                         _ => {}
                     }
@@ -713,44 +1070,85 @@ impl Editor {
                     }
                 }
                 KeyCode::Char(_c) => {
-                    // If there's a selection, delete it first
+                    // If there's a selection, delete it first (tracked)
                     if self.sel_start.is_some() && self.get_selection_range().is_some() {
-                        self.delete_selection();
+                        if let Some(deleted) = self.get_selected_text() {
+                            let ((sr, sc), (er, ec)) = self.get_selection_range().unwrap();
+                            self.delete_selection();
+                            self.undo.push(EditAction::DeleteSelection {
+                                start_row: sr, start_col: sc,
+                                end_row: er, end_col: ec,
+                                deleted_text: deleted,
+                            });
+                        }
                     }
+                    let cr = self.cursor_row;
+                    let cc = self.cursor_col;
                     self.insert_char_internal(_c);
+                    self.undo.push(EditAction::InsertChar { row: cr, col: cc, ch: _c });
                     self.dirty = true;
                     self.sel_start = None;
                 }
                 KeyCode::Enter => {
                     if self.sel_start.is_some() && self.get_selection_range().is_some() {
-                        self.delete_selection();
+                        if let Some(deleted) = self.get_selected_text() {
+                            let ((sr, sc), (er, ec)) = self.get_selection_range().unwrap();
+                            self.delete_selection();
+                            self.undo.push(EditAction::DeleteSelection {
+                                start_row: sr, start_col: sc,
+                                end_row: er, end_col: ec,
+                                deleted_text: deleted,
+                            });
+                        }
                     }
+                    let cr = self.cursor_row;
+                    let cc = self.cursor_col;
                     self.insert_newline_internal();
+                    self.undo.push(EditAction::InsertNewline { row: cr, col: cc });
                     self.dirty = true;
                     self.sel_start = None;
                 }
                 KeyCode::Backspace => {
                     if self.sel_start.is_some() && self.get_selection_range().is_some() {
-                        self.delete_selection();
-                    } else {
-                        self.delete_char_internal();
+                        if let Some(deleted) = self.get_selected_text() {
+                            let ((sr, sc), (er, ec)) = self.get_selection_range().unwrap();
+                            self.delete_selection();
+                            self.undo.push(EditAction::DeleteSelection {
+                                start_row: sr, start_col: sc,
+                                end_row: er, end_col: ec,
+                                deleted_text: deleted,
+                            });
+                        }
+                    } else if let Some(action) = self.delete_char_back_tracked() {
+                        self.undo.push(action);
                     }
                     self.dirty = true;
                     self.sel_start = None;
                 }
                 KeyCode::Delete => {
                     if self.sel_start.is_some() && self.get_selection_range().is_some() {
-                        self.delete_selection();
-                    } else {
-                        self.delete_char_forward();
+                        if let Some(deleted) = self.get_selected_text() {
+                            let ((sr, sc), (er, ec)) = self.get_selection_range().unwrap();
+                            self.delete_selection();
+                            self.undo.push(EditAction::DeleteSelection {
+                                start_row: sr, start_col: sc,
+                                end_row: er, end_col: ec,
+                                deleted_text: deleted,
+                            });
+                        }
+                    } else if let Some(action) = self.delete_char_forward_tracked() {
+                        self.undo.push(action);
                     }
                     self.dirty = true;
                     self.sel_start = None;
                 }
                 KeyCode::Tab => {
+                    let cr = self.cursor_row;
+                    let cc = self.cursor_col;
                     for _ in 0..4 {
                         self.insert_char_internal(' ');
                     }
+                    self.undo.push(EditAction::InsertTab { row: cr, col: cc });
                     self.dirty = true;
                 }
                 KeyCode::Esc => {

@@ -23,6 +23,10 @@ impl Row {
         self.chars.is_empty()
     }
 
+    pub fn chars(&self) -> &[char] {
+        &self.chars
+    }
+
     pub fn insert(&mut self, at: usize, c: char) {
         if at >= self.chars.len() {
             self.chars.push(c);
