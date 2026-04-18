@@ -1,4 +1,5 @@
 use crate::row::Row;
+use std::collections::HashSet;
 
 /// Represents a search/replace dialog state
 pub enum PromptMode {
@@ -15,6 +16,8 @@ pub struct FindState {
     pub input: String,
     /// Positions of matches: (row_index, char_offset_in_row)
     pub matches: Vec<(usize, usize)>,
+    /// Cached set for rendering lookups
+    pub match_set: HashSet<(usize, usize)>,
     pub current_match: usize,
 }
 
@@ -24,6 +27,7 @@ impl FindState {
             mode: PromptMode::None,
             input: String::new(),
             matches: Vec::new(),
+            match_set: HashSet::new(),
             current_match: 0,
         }
     }
@@ -32,6 +36,7 @@ impl FindState {
         self.mode = PromptMode::None;
         self.input.clear();
         self.matches.clear();
+        self.match_set.clear();
         self.current_match = 0;
     }
 
@@ -43,6 +48,7 @@ impl FindState {
                 self.matches.push((row_idx, pos));
             }
         }
+        self.match_set = self.matches.iter().copied().collect();
         self.current_match = 0;
     }
 

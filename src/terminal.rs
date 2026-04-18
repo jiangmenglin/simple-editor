@@ -11,13 +11,13 @@ impl Terminal {
     pub fn init() -> io::Result<()> {
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, terminal::EnterAlternateScreen)?;
+        execute!(stdout, terminal::EnterAlternateScreen, event::EnableMouseCapture)?;
         Ok(())
     }
 
     pub fn restore() -> io::Result<()> {
         let mut stdout = io::stdout();
-        execute!(stdout, terminal::LeaveAlternateScreen)?;
+        execute!(stdout, event::DisableMouseCapture, terminal::LeaveAlternateScreen)?;
         terminal::disable_raw_mode()?;
         Ok(())
     }
@@ -27,14 +27,29 @@ impl Terminal {
         Ok((cols, rows))
     }
 
-    pub fn read_key() -> io::Result<KeyEvent> {
+    pub fn read_event() -> io::Result<Event> {
         loop {
             if event::poll(std::time::Duration::from_millis(100))? {
-                if let Event::Key(key_event) = event::read()? {
-                    if key_event.kind == KeyEventKind::Press {
-                        return Ok(key_event);
+                let ev = event::read()?;
+                match &ev {
+                    Event::Key(key_event) => {
+                        if key_event.kind == KeyEventKind::Press {
+                            return Ok(ev);
+                        }
                     }
+                    Event::Mouse(_) | Event::Resize(_, _) => {
+                        return Ok(ev);
+                    }
+                    _ => {}
                 }
+            }
+        }
+    }
+
+    pub fn read_key() -> io::Result<KeyEvent> {
+        loop {
+            if let Event::Key(key) = Self::read_event()? {
+                return Ok(key);
             }
         }
     }

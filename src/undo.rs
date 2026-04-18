@@ -47,6 +47,8 @@ pub enum EditAction {
     },
     ReplaceAll {
         old_rows: Vec<String>,
+        find_query: String,
+        replacement: String,
     },
 }
 

@@ -1,15 +1,20 @@
 use std::io;
-use std::collections::HashSet;
 
 use crossterm::{
     cursor,
-    event::{KeyCode, KeyEvent, KeyModifiers},
+    event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     execute,
     style::{Color, SetBackgroundColor, SetForegroundColor},
     terminal::{self, ClearType},
 };
 
 use clipboard::ClipboardProvider;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Unix,
+    Windows,
+}
 
 use crate::find::FindState;
 use crate::row::Row;
@@ -46,6 +51,9 @@ pub struct Editor {
     show_line_numbers: bool,
     language: Option<&'static syntax::LanguageConfig>,
     undo: UndoHistory,
+    trailing_newline: bool,
+    line_ending: LineEnding,
+    mouse_dragging: bool,
 }
 
 impl Editor {
@@ -66,6 +74,9 @@ impl Editor {
             show_line_numbers: true,
             language: None,
             undo: UndoHistory::new(),
+            trailing_newline: false,
+            line_ending: LineEnding::Unix,
+            mouse_dragging: false,
         };
         if let Some(ref fname) = filename {
             editor.open_file(fname)?;
@@ -79,7 +90,32 @@ impl Editor {
 
     fn open_file(&mut self, path: &str) -> io::Result<()> {
         let content = std::fs::read_to_string(path)?;
-        self.rows = content.lines().map(Row::from).collect();
+
+        // Detect trailing newline
+        let trimmed = if content.ends_with("\r\n") {
+            self.trailing_newline = true;
+            &content[..content.len() - 2]
+        } else if content.ends_with('\n') {
+            self.trailing_newline = true;
+            &content[..content.len() - 1]
+        } else {
+            self.trailing_newline = false;
+            content.as_str()
+        };
+
+        // Detect line ending style
+        self.line_ending = if trimmed.contains("\r\n") {
+            LineEnding::Windows
+        } else {
+            LineEnding::Unix
+        };
+
+        let normalized = trimmed.replace("\r\n", "\n");
+        self.rows = if normalized.is_empty() {
+            vec![Row::new()]
+        } else {
+            normalized.lines().map(Row::from).collect()
+        };
         if self.rows.is_empty() {
             self.rows.push(Row::new());
         }
@@ -103,7 +139,14 @@ impl Editor {
             }
         };
 
-        let content: String = self.rows.iter().map(|r| r.as_str()).collect::<Vec<_>>().join("\n");
+        let sep = match self.line_ending {
+            LineEnding::Unix => "\n",
+            LineEnding::Windows => "\r\n",
+        };
+        let mut content: String = self.rows.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(sep);
+        if self.trailing_newline {
+            content.push_str(sep);
+        }
         std::fs::write(&filename, content)?;
         self.dirty = false;
         self.set_status(&format!("Saved to {}", filename));
@@ -119,6 +162,8 @@ impl Editor {
         self.filename = None;
         self.dirty = false;
         self.sel_start = None;
+        self.trailing_newline = false;
+        self.line_ending = LineEnding::Unix;
         self.undo.clear();
         self.set_status("New file created.");
     }
@@ -379,7 +424,7 @@ impl Editor {
                 self.cursor_row = row;
                 self.cursor_col = col;
             }
-            EditAction::ReplaceAll { old_rows } => {
+            EditAction::ReplaceAll { old_rows, find_query: _, replacement: _ } => {
                 self.rows = old_rows.iter().map(|s| Row::from(s.as_str())).collect();
                 if self.rows.is_empty() {
                     self.rows.push(Row::new());
@@ -464,9 +509,16 @@ impl Editor {
                     self.cursor_col = lines.last().map(|l| l.chars().count()).unwrap_or(0);
                 }
             }
-            EditAction::ReplaceAll { old_rows: _ } => {
-                // Can't redo ReplaceAll without storing the replacement info.
-                // For now, this is a no-op since we don't store the replacement details.
+            EditAction::ReplaceAll { old_rows: _, find_query, replacement } => {
+                let mut count = 0;
+                for row in &mut self.rows {
+                    count += row.replace_all(find_query.as_str(), replacement.as_str());
+                }
+                if self.cursor_row >= self.rows.len() {
+                    self.cursor_row = self.rows.len() - 1;
+                }
+                self.cursor_col = self.cursor_col.min(self.rows[self.cursor_row].len());
+                self.set_status(&format!("Redo: replaced {} occurrence(s).", count));
             }
         }
         self.dirty = true;
@@ -703,7 +755,7 @@ impl Editor {
             count += row.replace_all(&query, &replacement);
         }
 
-        self.undo.push(EditAction::ReplaceAll { old_rows });
+        self.undo.push(EditAction::ReplaceAll { old_rows, find_query: query, replacement });
 
         // Fix cursor if it's now out of bounds
         if self.cursor_row >= self.rows.len() {
@@ -725,14 +777,8 @@ impl Editor {
         let gutter_w = self.gutter_width();
         let text_area_width = term_cols - gutter_w;
 
-        // Collect match positions for highlighting
-        let match_positions: HashSet<(usize, usize)> = {
-            let mut set = HashSet::new();
-            for &(r, c) in &self.find.matches {
-                set.insert((r, c));
-            }
-            set
-        };
+        // Use cached match set
+        let match_positions = &self.find.match_set;
 
         // Get selection range for highlighting
         let sel_range = self.get_selection_range();
@@ -749,11 +795,12 @@ impl Editor {
             }
         }
 
-        for i in 0..term_rows.saturating_sub(1) {
-            let file_row = self.offset_row + i;
-            execute!(stdout, cursor::MoveTo(0, i as u16))?;
+        let visible_rows = term_rows.saturating_sub(2);
 
-            // Render gutter (line numbers or ~)
+        for i in 0..visible_rows {
+            let file_row = self.offset_row + i;
+            execute!(stdout, cursor::MoveTo(0, i as u16), terminal::Clear(ClearType::CurrentLine))?;
+
             if file_row >= self.rows.len() {
                 // Empty area
                 if self.show_line_numbers {
@@ -805,26 +852,22 @@ impl Editor {
                     Vec::new()
                 };
 
-                // Character-by-character rendering for highlights
+                // Batch rendering: collect runs of same-style characters
                 let chars: Vec<char> = render_str.chars().collect();
+                let mut batch = String::new();
                 let mut in_match = false;
                 let mut in_selection = false;
                 let mut current_syntax_color: Option<Color> = None;
 
+                let qlen = if !self.find.input.is_empty() { self.find.input.chars().count() } else { 0 };
+
                 for (ci, ch) in chars.iter().enumerate() {
                     let actual_col = start_char + ci;
 
-                    // Check if this char is part of a search match
-                    let is_match = if !self.find.input.is_empty() {
-                        let qlen = self.find.input.chars().count();
-                        match_positions.iter().any(|&(r, c)| {
-                            r == file_row && actual_col >= c && actual_col < c + qlen
-                        })
-                    } else {
-                        false
-                    };
+                    let is_match = qlen > 0 && match_positions.iter().any(|&(r, c)| {
+                        r == file_row && actual_col >= c && actual_col < c + qlen
+                    });
 
-                    // Check if this char is part of selection
                     let is_selected = if let Some(((sr, sc), (er, ec))) = sel_range {
                         (file_row > sr || (file_row == sr && actual_col >= sc))
                             && (file_row < er || (file_row == er && actual_col < ec))
@@ -832,34 +875,40 @@ impl Editor {
                         false
                     };
 
-                    // Syntax highlight color for this char
                     let syn_color = if actual_col < syntax_highlights.len() {
                         syntax_highlights[actual_col].foreground_color()
                     } else {
                         None
                     };
 
-                    // Apply search match highlight (highest priority)
-                    if is_match && !in_match {
-                        execute!(stdout, SetBackgroundColor(Color::DarkYellow), SetForegroundColor(Color::Black))?;
-                        in_match = true;
-                    } else if !is_match && in_match {
-                        execute!(stdout, SetBackgroundColor(Color::Reset), SetForegroundColor(Color::Reset))?;
-                        in_match = false;
-                    }
+                    // Check if style state changed
+                    let style_changed =
+                        (is_match != in_match) ||
+                        (is_selected != in_selection) ||
+                        (!is_match && !is_selected && syn_color != current_syntax_color);
 
-                    // Apply selection highlight
-                    if is_selected && !in_selection {
-                        execute!(stdout, SetBackgroundColor(Color::DarkCyan), SetForegroundColor(Color::White))?;
-                        in_selection = true;
-                    } else if !is_selected && in_selection {
-                        execute!(stdout, SetBackgroundColor(Color::Reset), SetForegroundColor(Color::Reset))?;
-                        in_selection = false;
-                    }
-
-                    // Apply syntax highlight (only when no search/selection override)
-                    if !is_match && !is_selected {
-                        if syn_color != current_syntax_color {
+                    if style_changed {
+                        // Flush batch
+                        if !batch.is_empty() {
+                            execute!(stdout, crossterm::style::Print(&batch))?;
+                            batch.clear();
+                        }
+                        // Apply new style
+                        if is_match && !in_match {
+                            execute!(stdout, SetBackgroundColor(Color::DarkYellow), SetForegroundColor(Color::Black))?;
+                            in_match = true; in_selection = false;
+                        } else if !is_match && in_match {
+                            execute!(stdout, SetBackgroundColor(Color::Reset), SetForegroundColor(Color::Reset))?;
+                            in_match = false;
+                        }
+                        if is_selected && !in_selection {
+                            execute!(stdout, SetBackgroundColor(Color::DarkCyan), SetForegroundColor(Color::White))?;
+                            in_selection = true; in_match = false;
+                        } else if !is_selected && in_selection {
+                            execute!(stdout, SetBackgroundColor(Color::Reset), SetForegroundColor(Color::Reset))?;
+                            in_selection = false;
+                        }
+                        if !is_match && !is_selected {
                             if let Some(c) = syn_color {
                                 execute!(stdout, SetForegroundColor(c))?;
                             } else {
@@ -868,8 +917,12 @@ impl Editor {
                             current_syntax_color = syn_color;
                         }
                     }
+                    batch.push(*ch);
+                }
 
-                    execute!(stdout, crossterm::style::Print(ch))?;
+                // Flush remaining batch
+                if !batch.is_empty() {
+                    execute!(stdout, crossterm::style::Print(&batch))?;
                 }
 
                 if in_match || in_selection || current_syntax_color.is_some() {
@@ -936,7 +989,6 @@ impl Editor {
         let mut stdout = io::stdout();
         let gutter_w = self.gutter_width();
 
-        execute!(stdout, terminal::Clear(ClearType::All))?;
         self.draw_rows(&mut stdout)?;
         self.draw_status_bar(&mut stdout)?;
         self.draw_message_bar(&mut stdout)?;
@@ -951,6 +1003,51 @@ impl Editor {
     }
 
     // ---- Main event loop ----
+
+    fn screen_to_cursor(&self, screen_row: u16, screen_col: u16) -> (usize, usize) {
+        let row = self.offset_row + (screen_row as usize);
+        let row = row.min(self.rows.len().saturating_sub(1));
+        let gutter_w = self.gutter_width();
+        let display_col = self.offset_col + (screen_col as usize).saturating_sub(gutter_w);
+        let col = self.rows[row].char_at_display_col(display_col);
+        (row, col)
+    }
+
+    fn handle_mouse_event(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let (row, col) = self.screen_to_cursor(mouse.row, mouse.column);
+                self.cursor_row = row;
+                self.cursor_col = col;
+                self.sel_start = Some((row, col));
+                self.mouse_dragging = true;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.mouse_dragging {
+                    let (row, col) = self.screen_to_cursor(mouse.row, mouse.column);
+                    self.cursor_row = row;
+                    self.cursor_col = col;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.mouse_dragging = false;
+                if let Some(start) = self.sel_start {
+                    if start == (self.cursor_row, self.cursor_col) {
+                        self.sel_start = None;
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                self.cursor_row = self.cursor_row.saturating_sub(3);
+                self.cursor_col = self.cursor_col.min(self.rows[self.cursor_row].len());
+            }
+            MouseEventKind::ScrollDown => {
+                self.cursor_row = (self.cursor_row + 3).min(self.rows.len() - 1);
+                self.cursor_col = self.cursor_col.min(self.rows[self.cursor_row].len());
+            }
+            _ => {}
+        }
+    }
 
     fn handle_selection_key(&mut self, key: &KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -985,19 +1082,21 @@ impl Editor {
     pub fn run(&mut self) -> io::Result<()> {
         self.set_status("Ctrl+Q: Quit | Ctrl+S: Save | Ctrl+N: New | Ctrl+F: Find | Ctrl+H: Replace | Ctrl+C/V: Copy/Paste");
         self.status_persist = true;
+        self.refresh_screen()?;
 
         loop {
-            self.refresh_screen()?;
-            let key = Terminal::read_key()?;
+            let event = Terminal::read_event()?;
 
-            // Clear persist status after any key
-            if self.status_persist {
-                // keep it
-            } else {
-                self.status_msg.clear();
-            }
+            match event {
+                Event::Key(key) => {
+                    // Clear persist status after any key
+                    if self.status_persist {
+                        // keep it
+                    } else {
+                        self.status_msg.clear();
+                    }
 
-            match key.code {
+                    match key.code {
                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     match c {
                         'q' => {
@@ -1161,12 +1260,23 @@ impl Editor {
                 }
             }
 
-            // After any action, clear persist flag
-            if !matches!(
-                key.code,
-                KeyCode::F(3) | KeyCode::Esc
-            ) {
-                self.status_persist = false;
+                // After any action, clear persist flag
+                if !matches!(
+                    key.code,
+                    KeyCode::F(3) | KeyCode::Esc
+                ) {
+                    self.status_persist = false;
+                }
+                self.refresh_screen()?;
+                }
+                Event::Mouse(mouse) => {
+                    self.handle_mouse_event(mouse);
+                    self.refresh_screen()?;
+                }
+                Event::Resize(_, _) => {
+                    self.refresh_screen()?;
+                }
+                _ => {}
             }
         }
 
