@@ -62,6 +62,13 @@ cargo run --release -- filename.txt
 | `Ctrl+C` | 复制选中内容到系统剪贴板 |
 | `Ctrl+V` | 从系统剪贴板粘贴 |
 
+### 撤销与重做
+
+| 快捷键 | 功能 |
+|--------|------|
+| `Ctrl+Z` | 撤销上一步操作 |
+| `Ctrl+Y` | 重做已撤销的操作 |
+
 ### 查找与替换
 
 | 快捷键 | 功能 |
@@ -71,6 +78,12 @@ cargo run --release -- filename.txt
 | `Shift+F3` | 跳到上一个匹配项 |
 | `Ctrl+H` | 替换（输入查找文本 → 输入替换文本 → 全部替换） |
 | `Esc` | 取消选择 / 清除搜索高亮 |
+
+### 视图
+
+| 快捷键 | 功能 |
+|--------|------|
+| `Ctrl+L` | 切换行号显示 |
 
 ## 界面说明
 
@@ -82,6 +95,8 @@ cargo run --release -- filename.txt
 
 查找匹配项以黄色背景高亮，选中文本以青色背景高亮。
 
+支持根据文件扩展名自动进行语法高亮，覆盖 Rust、Python、C/C++、JavaScript、TypeScript、Java、Go、Shell、JSON、TOML、HTML、CSS 等 13 种语言，包括关键字、类型、字符串、注释和数字的高亮。
+
 ## 项目结构
 
 ```
@@ -90,13 +105,16 @@ src/
 ├── editor.rs     # 主编辑器逻辑（事件循环、渲染、编辑操作）
 ├── row.rs        # 文本行数据结构
 ├── terminal.rs   # 终端初始化与输入输出封装
-└── find.rs       # 查找与替换状态管理
+├── find.rs       # 查找与替换状态管理
+├── syntax.rs     # 语法高亮引擎
+└── undo.rs       # 撤销/重做历史记录
 ```
 
 ## 依赖
 
 - [crossterm](https://crates.io/crates/crossterm) — 跨平台终端控制
 - [clipboard](https://crates.io/crates/clipboard) — 系统剪贴板访问
+- [unicode-width](https://crates.io/crates/unicode-width) — Unicode 字符宽度计算（支持 CJK 等宽字符）
 
 ## License
 

@@ -63,7 +63,7 @@ impl Editor {
             status_msg: String::new(),
             sel_start: None,
             status_persist: false,
-            show_line_numbers: false,
+            show_line_numbers: true,
             language: None,
             undo: UndoHistory::new(),
         };
